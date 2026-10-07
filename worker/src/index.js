@@ -23,13 +23,18 @@ const TRACKING_PARAMS = new Set([
 
 const REDIRECT_STATUSES = new Set([301, 302, 303, 307, 308]);
 
-export function isTrackingParam(rawName) {
-	let name;
+// Decoded, lower-cased name of a raw `name=value` segment, or null if it isn't valid
+// percent-encoding. Used for every comparison so `%67clid` and `GCLID` count as `gclid`.
+export function paramName(segment) {
 	try {
-		name = decodeURIComponent(rawName.replace(/\+/g, " ")).toLowerCase();
+		return decodeURIComponent(segment.split("=", 1)[0].replace(/\+/g, " ")).toLowerCase();
 	} catch {
-		return false;
+		return null;
 	}
+}
+
+export function isTrackingParam(name) {
+	if (name === null) return false;
 	return TRACKING_PARAMS.has(name) || TRACKING_PREFIXES.some((p) => name.startsWith(p));
 }
 
@@ -40,8 +45,7 @@ export function splitQuery(search) {
 	const stripped = [];
 	for (const segment of search.replace(/^\?/, "").split("&")) {
 		if (segment === "") continue;
-		const name = segment.split("=", 1)[0];
-		(isTrackingParam(name) ? stripped : kept).push(segment);
+		(isTrackingParam(paramName(segment)) ? stripped : kept).push(segment);
 	}
 	return { kept, stripped };
 }
@@ -55,8 +59,9 @@ export function restoreParams(location, requestUrl, stripped) {
 	const target = new URL(location, requestUrl);
 	if (!sameSite(target.hostname, requestUrl.hostname)) return null;
 
-	const present = new Set(splitQuery(target.search).stripped.map((s) => s.split("=", 1)[0]));
-	const missing = stripped.filter((s) => !present.has(s.split("=", 1)[0]));
+	// Compare decoded names, append the raw segments: the origin's own encoding is kept.
+	const present = new Set(splitQuery(target.search).stripped.map(paramName));
+	const missing = stripped.filter((s) => !present.has(paramName(s)));
 	if (missing.length === 0) return null;
 
 	const query = target.search.replace(/^\?/, "");

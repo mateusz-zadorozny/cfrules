@@ -100,6 +100,19 @@ test("params the origin already kept in Location are not duplicated", async () =
 	assert.equal(res.headers.get("Location"), "https://x.pl/b/?fbclid=F&utm_source=s");
 });
 
+test("dedup compares decoded names: %67clid in Location counts as gclid", async () => {
+	fakeOrigin(redirectTo("/b?%67clid=NEW"));
+	const res = await run("https://x.pl/a?gclid=OLD");
+	// nothing to restore → the origin's Location is passed through untouched
+	assert.equal(res.headers.get("Location"), "/b?%67clid=NEW");
+});
+
+test("dedup is case-insensitive: GCLID in Location counts as gclid", async () => {
+	fakeOrigin(redirectTo("/b?GCLID=NEW"));
+	const res = await run("https://x.pl/a?gclid=OLD&fbclid=F");
+	assert.equal(res.headers.get("Location"), "https://x.pl/b?GCLID=NEW&fbclid=F");
+});
+
 test("origin redirects are not followed by the Worker", async () => {
 	const seen = fakeOrigin(redirectTo("/b/"));
 	await run("https://x.pl/a/?fbclid=F");
