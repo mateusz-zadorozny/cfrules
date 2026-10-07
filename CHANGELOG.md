@@ -13,11 +13,16 @@
 
 - [`worker/`](worker/): Cloudflare Worker that strips marketing parameters before the origin and
   re-appends them to same-site redirect `Location` headers. Works unchanged as a Snippet.
-- Test suite (`npm test`, stub origin, 16 cases).
+- `scripts/ensure-routes.mjs` (run by `npm run deploy`): sets every Worker route to fail open —
+  `cf deploy` resets them to fail closed — and creates the static/admin exclusion routes;
+  `npm run routes:check` verifies without writing.
+- Test suite (`npm test`: 18 Worker cases against a stub origin, 5 route-script cases against a stub API).
 - `hosts.json` (gitignored) for per-account routes; `hosts.example.json` as a template.
 - Parameters: `gad_campaignid`, `srsltid`, `dclid`, `li_fat_id`, `twclid`; any `utm_*`, `mtm_*`,
-  `pk_*` by prefix; case-insensitive matching.
-- [POSTMORTEM.md](POSTMORTEM.md).
+  `pk_*` by prefix; case-insensitive and percent-decoded name matching (also when de-duplicating
+  restored params against `Location`).
+- [POSTMORTEM.md](POSTMORTEM.md); README section on when the Worker fits (server-side readers of
+  tracking params lose them).
 
 ### Removed
 

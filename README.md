@@ -1,4 +1,4 @@
-# Cloudflare — strip tracking parameters without breaking attribution
+# Cloudflare — strip tracking parameters before the origin, keep them in the browser
 
 [![My Services](https://img.shields.io/badge/MY_SERVICES-SHIFT64.COM-C2703D?style=for-the-badge&labelColor=4A4A4A)](https://shift64.com)
 
@@ -29,7 +29,7 @@ Campaign links make one page look like thousands of URLs to a page cache:
 Each is a cache miss that renders the page from scratch. The Worker in [`worker/`](worker/)
 removes marketing parameters from the request it sends to the origin, so all of these hit the
 same cache entry — while the visitor's browser keeps the original URL for GA4, Meta Pixel and
-Google Ads to read.
+Google Ads to read. The origin never sees them; see [When to use it](#when-to-use-it--and-when-not).
 
 The part the v0.1.0 rule could not do: when the origin answers with a redirect, the Worker
 appends the stripped parameters back to `Location`.
@@ -40,6 +40,23 @@ browser ── GET /lamp?gclid=G&a=1 ──▶ Worker ── GET /lamp?a=1 ─�
 browser ◀── 301 /lamp/?a=1&gclid=G ── Worker ◀── 301 /lamp/?a=1 ───┘
                         ▲ restored
 ```
+
+## When to use it — and when not
+
+The Worker keeps tracking parameters **in the browser URL** (including across origin
+redirects). It deliberately hides them **from the origin**. That is the whole point — and the
+condition for using it:
+
+| Reads tracking params from… | Works? | Examples |
+|---|---|---|
+| the browser URL, client-side JS | ✅ | GA4 / gtag, Google Ads conversion linker, Meta Pixel (`_fbc` cookie), TikTok Pixel, WooCommerce Order Attribution (sourcebuster.js) |
+| cookies set by that JS, sent to the server later | ✅ | Meta Conversions API using `_fbc` / `_fbp`, server-side GTM fed by the browser |
+| **the incoming request on the server** (`$_GET`, `$request->query`, nginx `$arg_*`) | ❌ **data lost** | PHP plugins that store `utm_*` / `gclid` on the first request, affiliate plugins reading `?aff=` server-side, origin access-log attribution, CRMs that read UTMs from the landing request |
+
+Before deploying, check every plugin and integration that touches campaign parameters. If one
+reads them server-side, either remove that parameter from the Worker's list or don't use the
+Worker on that site. Parameters that change page behaviour (`ref`, `ao_noptimize`, …) are already
+excluded — see [Parameters stripped](#parameters-stripped).
 
 ## How it behaves
 
@@ -95,21 +112,34 @@ redirect, e.g. both apex and `www` when one redirects to the other:
 ]
 ```
 
+Create an API token (**My Profile → API Tokens → Custom token**) with **Zone → Zone → Read** and
+**Zone → Workers Routes → Edit** for the zones in `hosts.json`, then:
+
 ```bash
-npm run deploy                            # cf deploy — uploads the Worker and creates the routes
+export CLOUDFLARE_API_TOKEN=…
+npm run deploy        # cf deploy, then scripts/ensure-routes.mjs
+npm run routes:check  # read-only: exit 1 if any route is wrong
 ```
 
-Then, in the dashboard (**zone → Workers Routes**) — the `cf` CLI has no command for these yet:
+`npm run deploy` runs `cf deploy` (uploads the Worker, creates `<host>/*` routes) and then
+[`scripts/ensure-routes.mjs`](worker/scripts/ensure-routes.mjs), which makes the zone match
+`hosts.json`:
 
-1. **Exclude static and admin paths.** Add routes with **Worker = None** for each host that serves
-   pages: `<host>/wp-content/*`, `<host>/wp-includes/*`, `<host>/wp-admin/*`, `<host>/wp-json/*`.
-   The more specific route wins, so assets never invoke the Worker and don't count toward limits.
-2. **Set every Worker route to *Fail open (proceed)*** (Edit → *Request limit failure mode*).
-   The default is *fail closed*: over the Free plan limit, the whole site returns error 1027.
-   With fail open, traffic goes straight to the origin with the full URL — correct, just no cache gain.
+1. **Fail open on every Worker route.** The default — and the state **`cf deploy` resets every
+   route to on each deploy** — is *fail closed*: over the Free plan limit, the whole site returns
+   error 1027. With fail open, traffic goes straight to the origin with the full URL: correct, just
+   no cache gain. (The API field is `request_limit_fail_open`; it is returned by
+   `GET /zones/:id/workers/routes` but missing from the public API reference.)
+2. **Exclusion routes** with no Worker for `<host>/wp-content/*`, `/wp-includes/*`, `/wp-admin/*`,
+   `/wp-json/*`. The more specific route wins, so assets never invoke the Worker and don't count
+   toward limits.
+
+It never overwrites a route owned by another Worker — that is reported and exits 1. Without a
+token, do both steps by hand in **zone → Workers Routes** (Edit → *Request limit failure mode*).
 
 > [!WARNING]
-> **Every `cf deploy` resets all routes of the Worker to *fail closed*.** Re-check step 2 after each deploy.
+> If you deploy with plain `cf deploy` (not `npm run deploy`), run `npm run routes` afterwards —
+> otherwise the routes stay *fail closed*.
 
 Finally, disable any Transform Rule that strips the same parameters — Transform Rules run
 **before** Workers, so parameters removed there can't be restored.
@@ -120,9 +150,10 @@ Finally, disable any Transform Rule that strips the same parameters — Transfor
 npm test
 ```
 
-16 cases with `fetch` replaced by a stub origin: parameter position, non-adjacent parameters,
+18 Worker cases with `fetch` replaced by a stub origin: parameter position, non-adjacent parameters,
 redirect restoration (relative `Location`, apex ↔ `www`, cross-site), duplicates, `POST`,
-byte-for-byte forwarding, malformed percent-encoding. It proves the logic, not the Cloudflare
+byte-for-byte forwarding, encoded/upper-case names (`%67clid`, `GCLID`), malformed
+percent-encoding — plus 5 cases for `ensure-routes.mjs` against a stub API. It proves the logic, not the Cloudflare
 runtime — after deploying, check a real redirect:
 
 ```bash
@@ -167,7 +198,7 @@ other correct option: the cache ignores the parameters, the origin still receive
 
 | Path | Purpose |
 |---|---|
-| [`worker/`](worker/) | The Worker: `src/index.js`, tests, `cloudflare.config.ts`, `hosts.example.json`. |
+| [`worker/`](worker/) | The Worker (`src/index.js`), route setup (`scripts/ensure-routes.mjs`), tests, `cloudflare.config.ts`, `hosts.example.json`. |
 | [`POSTMORTEM.md`](POSTMORTEM.md) | What went wrong with v0.1.0 and how it was found and fixed. |
 | [`CHANGELOG.md`](CHANGELOG.md) | Release notes. |
 | [`legacy/`](legacy/) | ⛔ The withdrawn v0.1.0 Transform Rule expressions, kept for reference only. |

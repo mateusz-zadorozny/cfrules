@@ -142,6 +142,9 @@ origin returns valid 301s and 200s, and the loss happens in the visitor's browse
    - if the response is a 3xx to the **same site** (`www` ↔ apex included), appends the stripped
      parameters to `Location`, skipping any the origin already kept;
    - leaves cross-site redirects (payment gateways) untouched.
+
+   Trade-off, unchanged from v0.1.0 and now documented: the origin does not see the stripped
+   parameters, so anything that reads them server-side from the landing request loses them.
 3. **Same requests after the fix** (Store C):
 
    ```
@@ -181,7 +184,8 @@ origin returns valid 301s and 200s, and the loss happens in the visitor's browse
 - **Workers route failure mode defaults to *fail closed*.** On the Free plan (100,000 Worker
   requests/day per account), exceeding the limit would make the whole site return error 1027.
   Set *fail open* so traffic goes straight to the origin with the full URL instead.
-- **`cf deploy` resets every route of the Worker to *fail closed*.** Re-check after each deploy.
+- **`cf deploy` resets every route of the Worker to *fail closed*.** Fixed by
+  [`scripts/ensure-routes.mjs`](worker/scripts/ensure-routes.mjs), run as part of `npm run deploy`.
 - **Worker routes cannot match on the query string**, so the Worker runs on every request of its
   route. Script-less routes for static and admin paths keep the request count down.
   On Store B: ~2.8k Worker requests overnight versus ~7.2k origin requests.
@@ -199,4 +203,5 @@ origin returns valid 301s and 200s, and the loss happens in the visitor's browse
 | ✅ | Mark the v0.1.0 expressions as withdrawn ([`legacy/`](legacy/)) | Done |
 | ⬜ | Switch off "strip tracking parameters" in Super Page Cache on Store E | Open |
 | ⬜ | Report the defect upstream to the Super Page Cache plugin | Open |
-| ⬜ | Find a deploy path that does not reset route failure mode | Open |
+| ✅ | Stop relying on manual dashboard fixes for fail open: `npm run deploy` re-applies it via the API, `npm run routes:check` verifies | Done (stub API tests; first real run pending an API token) |
+| ✅ | Document that the origin no longer sees tracking params (server-side readers lose them) | Done — README *When to use it* |
