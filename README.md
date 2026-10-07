@@ -112,14 +112,25 @@ redirect, e.g. both apex and `www` when one redirects to the other:
 ]
 ```
 
-Create an API token (**My Profile → API Tokens → Custom token**) with **Zone → Zone → Read** and
-**Zone → Workers Routes → Edit** for the zones in `hosts.json`, then:
+Two credentials, on purpose:
+
+- **`cf deploy`** uses your `cf` login (`cf auth create`). It uploads the script, which needs
+  **Account → Workers Scripts → Edit**.
+- **`scripts/ensure-routes.mjs`** uses `CLOUDFLARE_ROUTES_API_TOKEN` — a custom token
+  (**My Profile → API Tokens**) with only **Zone → Zone → Read** and **Zone → Workers Routes → Edit**
+  for the zones in `hosts.json`.
 
 ```bash
-export CLOUDFLARE_API_TOKEN=…
+export CLOUDFLARE_ROUTES_API_TOKEN=…
 npm run deploy        # cf deploy, then scripts/ensure-routes.mjs
 npm run routes:check  # read-only: exit 1 if any route is wrong
 ```
+
+> [!IMPORTANT]
+> Don't put the routes token in `CLOUDFLARE_API_TOKEN`: `cf` uses that variable *instead of* your
+> saved login, and `cf deploy` then fails for lack of Workers Scripts permission. If you do use one
+> `CLOUDFLARE_API_TOKEN` for everything (e.g. in CI), give it all three permissions — the script
+> falls back to it when `CLOUDFLARE_ROUTES_API_TOKEN` is unset.
 
 `npm run deploy` runs `cf deploy` (uploads the Worker, creates `<host>/*` routes) and then
 [`scripts/ensure-routes.mjs`](worker/scripts/ensure-routes.mjs), which makes the zone match
@@ -134,7 +145,9 @@ npm run routes:check  # read-only: exit 1 if any route is wrong
    `/wp-json/*`. The more specific route wins, so assets never invoke the Worker and don't count
    toward limits.
 
-It never overwrites a route owned by another Worker — that is reported and exits 1. Without a
+If a host's `<host>/*` route is missing or belongs to another Worker, the script reports it,
+exits 1 and **changes nothing for that host** — exclusion routes there would let `/wp-admin/*` and
+friends bypass the other Worker. Without a
 token, do both steps by hand in **zone → Workers Routes** (Edit → *Request limit failure mode*).
 
 > [!WARNING]
@@ -153,7 +166,7 @@ npm test
 18 Worker cases with `fetch` replaced by a stub origin: parameter position, non-adjacent parameters,
 redirect restoration (relative `Location`, apex ↔ `www`, cross-site), duplicates, `POST`,
 byte-for-byte forwarding, encoded/upper-case names (`%67clid`, `GCLID`), malformed
-percent-encoding — plus 5 cases for `ensure-routes.mjs` against a stub API. It proves the logic, not the Cloudflare
+percent-encoding — plus 7 cases for `ensure-routes.mjs` against a stub API (including a run from a path with a space). It proves the logic, not the Cloudflare
 runtime — after deploying, check a real redirect:
 
 ```bash
