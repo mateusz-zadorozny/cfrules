@@ -7,9 +7,11 @@
 //   node scripts/ensure-routes.mjs           # fix what's wrong
 //   node scripts/ensure-routes.mjs --check   # report only, exit 1 if anything is wrong
 //
-// Needs CLOUDFLARE_API_TOKEN with Zone → Zone: Read and Zone → Workers Routes: Edit.
+// Needs CLOUDFLARE_ROUTES_API_TOKEN (falls back to CLOUDFLARE_API_TOKEN) with
+// Zone → Zone: Read and Zone → Workers Routes: Edit.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, realpathSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 export const WORKER = "strip-tracking-params";
 export const EXCLUDED_PATHS = ["wp-content", "wp-includes", "wp-admin", "wp-json"];
@@ -21,9 +23,18 @@ export function plan(zones, routesByZone) {
 		for (const host of hosts) {
 			const pattern = `${host}/*`;
 			const route = routes.find((r) => r.pattern === pattern);
-			if (!route) actions.push({ zone, kind: "missing-worker-route", pattern });
-			else if (route.script !== WORKER) actions.push({ zone, kind: "foreign-worker-route", pattern, script: route.script });
-			else if (route.request_limit_fail_open !== true) actions.push({ zone, kind: "fail-open", route });
+			// Without our own `<host>/*` route, exclusions would only carve holes into whatever
+			// else serves the host — e.g. let /wp-admin/* bypass another Worker's access control.
+			// Report and leave the host alone.
+			if (!route) {
+				actions.push({ zone, kind: "missing-worker-route", pattern });
+				continue;
+			}
+			if (route.script !== WORKER) {
+				actions.push({ zone, kind: "foreign-worker-route", pattern, script: route.script });
+				continue;
+			}
+			if (route.request_limit_fail_open !== true) actions.push({ zone, kind: "fail-open", route });
 
 			for (const path of EXCLUDED_PATHS) {
 				const exclusion = `${host}/${path}/*`;
@@ -82,10 +93,15 @@ export async function run({ zones, call, check, log = console.log }) {
 	return unresolved;
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-	const token = process.env.CLOUDFLARE_API_TOKEN;
+// Compare real filesystem paths, not URL strings: import.meta.url percent-encodes spaces and
+// resolves symlinks (macOS /var → /private/var), so `file://${argv[1]}` silently never matched.
+const isCli = process.argv[1] && fileURLToPath(import.meta.url) === realpathSync(process.argv[1]);
+if (isCli) {
+	// A separate variable on purpose: CLOUDFLARE_API_TOKEN also replaces the `cf` CLI login, so a
+	// routes-only token there would break `cf deploy` in the same shell.
+	const token = process.env.CLOUDFLARE_ROUTES_API_TOKEN ?? process.env.CLOUDFLARE_API_TOKEN;
 	if (!token) {
-		console.error("CLOUDFLARE_API_TOKEN is not set (needs Zone: Read + Workers Routes: Edit).");
+		console.error("Set CLOUDFLARE_ROUTES_API_TOKEN (Zone: Read + Workers Routes: Edit). See README → Setup.");
 		process.exit(2);
 	}
 	const zones = JSON.parse(readFileSync(new URL("../hosts.json", import.meta.url), "utf8"));
