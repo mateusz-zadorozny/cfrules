@@ -5,8 +5,10 @@
 	"scripts": {
 		"dev": "cf dev",
 		"build": "cf build",
-		"deploy": "cf deploy",
-		"test": "node --test"
+		"deploy": "cf deploy && node scripts/ensure-routes.mjs",
+		"test": "node --test",
+		"routes": "node scripts/ensure-routes.mjs",
+		"routes:check": "node scripts/ensure-routes.mjs --check"
 	},
 	"devDependencies": {
 		"@cloudflare/vite-plugin": "beta",
