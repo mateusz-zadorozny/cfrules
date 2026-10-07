@@ -1,5 +1,18 @@
 # Changelog
 
+## [0.2.1] — 2026-10-07
+
+### Fixed
+
+- `ensure-routes.mjs` no longer creates exclusion routes for a host whose `<host>/*` route is
+  missing or owned by another Worker. Before, `/wp-admin/*` etc. could be carved out of that
+  Worker, bypassing it (and any access control it does).
+- `ensure-routes.mjs` silently did nothing (exit 0) when run from a path with a space or through
+  a symlink (e.g. macOS `/var` → `/private/var`). CLI detection now compares real paths.
+- The routes token moved to `CLOUDFLARE_ROUTES_API_TOKEN` (falls back to `CLOUDFLARE_API_TOKEN`).
+  Exporting a routes-only token as `CLOUDFLARE_API_TOKEN`, as the 0.2.0 README said, replaced the
+  `cf` login and broke `cf deploy`. README documents both credentials and their permissions.
+
 ## [0.2.0] — 2026-10-07
 
 ### ⚠️ Breaking
@@ -33,4 +46,5 @@
 
 - Cloudflare URL Rewrite Transform Rule stripping tracking parameters. **Withdrawn in 0.2.0.**
 
+[0.2.1]: https://github.com/mateusz-zadorozny/cfrules/releases/tag/v0.2.1
 [0.2.0]: https://github.com/mateusz-zadorozny/cfrules/releases/tag/v0.2.0

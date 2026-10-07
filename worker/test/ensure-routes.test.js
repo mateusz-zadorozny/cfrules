@@ -1,6 +1,11 @@
 // Stub Cloudflare API: proves the plan/apply logic, not the real API.
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
+import { copyFileSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { run, WORKER } from "../scripts/ensure-routes.mjs";
 
 const zones = [{ zone: "x.pl", hosts: ["x.pl"] }];
@@ -53,8 +58,28 @@ test("everything correct → no writes, exit code 0", async () => {
 	assert.equal(calls.filter((c) => c.method !== "GET").length, 0);
 });
 
-test("a route owned by another Worker is reported, never overwritten", async () => {
-	const { call, calls } = stubApi([{ id: "w", pattern: "x.pl/*", script: "other-worker", request_limit_fail_open: true }, ...exclusions]);
+test("host served by another Worker: reported, no exclusions carved into it", async () => {
+	const { call, calls } = stubApi([{ id: "w", pattern: "x.pl/*", script: "other-worker", request_limit_fail_open: true }]);
 	assert.equal(await run({ zones, call, check: false, log: quiet }), 1);
 	assert.equal(calls.filter((c) => c.method !== "GET").length, 0);
+});
+
+test("our <host>/* route missing: reported, no exclusions created", async () => {
+	const { call, calls } = stubApi([]);
+	assert.equal(await run({ zones, call, check: false, log: quiet }), 1);
+	assert.equal(calls.filter((c) => c.method !== "GET").length, 0);
+});
+
+test("CLI entrypoint runs from a path with a space", () => {
+	const dir = mkdtempSync(join(tmpdir(), "dir with space "));
+	mkdirSync(join(dir, "scripts"));
+	copyFileSync(fileURLToPath(new URL("../scripts/ensure-routes.mjs", import.meta.url)), join(dir, "scripts", "ensure-routes.mjs"));
+	const env = { ...process.env };
+	delete env.CLOUDFLARE_ROUTES_API_TOKEN;
+	delete env.CLOUDFLARE_API_TOKEN;
+	const res = spawnSync(process.execPath, [join(dir, "scripts", "ensure-routes.mjs")], { env, encoding: "utf8" });
+	rmSync(dir, { recursive: true });
+	// exit 2 + message = the main block ran; before the fix it exited 0 silently
+	assert.equal(res.status, 2);
+	assert.match(res.stderr, /CLOUDFLARE_ROUTES_API_TOKEN/);
 });
