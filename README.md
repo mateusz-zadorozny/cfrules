@@ -1,205 +1,207 @@
-# Cloudflare Transform Rule — Strip Tracking Parameters from URLs
+# Cloudflare — strip tracking parameters before the origin, keep them in the browser
 
 [![My Services](https://img.shields.io/badge/MY_SERVICES-SHIFT64.COM-C2703D?style=for-the-badge&labelColor=4A4A4A)](https://shift64.com)
 
-A single Cloudflare **Transform Rule** that detects and removes tracking / analytics query parameters (UTM, Facebook `fbclid`, Google `gclid`, Matomo, Piwik, Mailchimp, Klaviyo, Microsoft `msclkid`, and many more) from incoming request URLs — **before** the request reaches your origin or cache.
-
-The result: clean, canonical URLs. One cache entry per page instead of one per campaign link, better cache hit ratios, cleaner analytics, and no tracking junk leaking into logs or referrers.
-
----
-
-## Table of contents
-
-- [How it works](#how-it-works)
-- [Why do this at the edge?](#why-do-this-at-the-edge)
-- [Prerequisites](#prerequisites)
-- [Step-by-step setup (Cloudflare Dashboard)](#step-by-step-setup-cloudflare-dashboard)
-- [The two expressions](#the-two-expressions)
-- [Understanding the regex](#understanding-the-regex)
-- [Testing](#testing)
-- [Customizing the parameter list](#customizing-the-parameter-list)
-- [Caveats & gotchas](#caveats--gotchas)
-- [Files in this repo](#files-in-this-repo)
+> [!CAUTION]
+> **Post-mortem (October 2026): the Transform Rule published here in v0.1.0 was broken. Don't use it.**
+>
+> - A tracking parameter in **first** position left a dangling `&` (`?fbclid=x&a=1` → origin got `?&a=1`), which WordPress answers with a 301.
+> - `regex_replace()` replaces **only the first match**, so non-adjacent parameters were only partly removed.
+> - **By design**, every redirect the origin issues (apex ↔ `www`, trailing slash, canonical) was built from the stripped URL, so `gclid` / `fbclid` / `gad_source` **disappeared from the browser URL**. On one store running Google Ads this hit 21 paid landings in the logs and, invisibly, every landing on the non-canonical host.
+>
+> The rule is withdrawn ([`legacy/`](legacy/)) and replaced by a **Worker** that strips the same parameters and puts them back on same-site redirects.
+> Full write-up: **[POSTMORTEM.md](POSTMORTEM.md)** · report: [issue #1](https://github.com/mateusz-zadorozny/cfrules/issues/1) · fix: [PR #2](https://github.com/mateusz-zadorozny/cfrules/pull/2) · [CHANGELOG](CHANGELOG.md)
+>
+> **If you deployed v0.1.0:** disable the rule (Rules → Transform Rules → URL Rewrite). If the *Super Page Cache* WordPress plugin created a `[DO NOT EDIT]` rule with the same regex, switch off its "strip tracking parameters" option instead — the plugin owns that rule.
 
 ---
 
-## How it works
+## What this does
 
-A Transform Rule has two halves:
-
-| Half | Cloudflare term | What it does here |
-|------|-----------------|-------------------|
-| **If** | *Custom filter expression* | Fires only when the query string contains at least one tracking parameter. |
-| **Then** | *Rewrite URL → Query → Rewrite to → Dynamic* | Runs a `regex_replace()` that strips every known tracking parameter from the query string, leaving the rest intact. |
-
-A visitor lands on:
+Campaign links make one page look like thousands of URLs to a page cache:
 
 ```
-https://example.com/blog/post?id=42&utm_source=newsletter&utm_medium=email&fbclid=AbC123
+/product/lamp/?utm_source=newsletter&utm_campaign=autumn
+/product/lamp/?gclid=Cj0KCQjw…
+/product/lamp/?fbclid=IwAR…
 ```
 
-Cloudflare rewrites it to:
+Each is a cache miss that renders the page from scratch. The Worker in [`worker/`](worker/)
+removes marketing parameters from the request it sends to the origin, so all of these hit the
+same cache entry — while the visitor's browser keeps the original URL for GA4, Meta Pixel and
+Google Ads to read. The origin never sees them; see [When to use it](#when-to-use-it--and-when-not).
+
+The part the v0.1.0 rule could not do: when the origin answers with a redirect, the Worker
+appends the stripped parameters back to `Location`.
 
 ```
-https://example.com/blog/post?id=42
+browser ── GET /lamp?gclid=G&a=1 ──▶ Worker ── GET /lamp?a=1 ──▶ origin
+                                                                   │
+browser ◀── 301 /lamp/?a=1&gclid=G ── Worker ◀── 301 /lamp/?a=1 ───┘
+                        ▲ restored
 ```
 
-The legitimate `id=42` parameter survives; the tracking ones are gone.
+## When to use it — and when not
 
-> **Note on rewrite vs. redirect:** This is a **rewrite** (a *Transform Rule*), not a 301/302 redirect. The visitor's address bar still shows the original messy URL, but Cloudflare and your origin/cache see the clean version. If you want the browser's address bar cleaned too, you need a **Redirect Rule** instead — see [Caveats](#caveats--gotchas).
+The Worker keeps tracking parameters **in the browser URL** (including across origin
+redirects). It deliberately hides them **from the origin**. That is the whole point — and the
+condition for using it:
 
----
+| Reads tracking params from… | Works? | Examples |
+|---|---|---|
+| the browser URL, client-side JS | ✅ | GA4 / gtag, Google Ads conversion linker, Meta Pixel (`_fbc` cookie), TikTok Pixel, WooCommerce Order Attribution (sourcebuster.js) |
+| cookies set by that JS, sent to the server later | ✅ | Meta Conversions API using `_fbc` / `_fbp`, server-side GTM fed by the browser |
+| **the incoming request on the server** (`$_GET`, `$request->query`, nginx `$arg_*`) | ❌ **data lost** | PHP plugins that store `utm_*` / `gclid` on the first request, affiliate plugins reading `?aff=` server-side, origin access-log attribution, CRMs that read UTMs from the landing request |
 
-## Why do this at the edge?
+Before deploying, check every plugin and integration that touches campaign parameters. If one
+reads them server-side, either remove that parameter from the Worker's list or don't use the
+Worker on that site. Parameters that change page behaviour (`ref`, `ao_noptimize`, …) are already
+excluded — see [Parameters stripped](#parameters-stripped).
 
-- **Cache efficiency.** `?utm_source=a` and `?utm_source=b` are, by default, two different cache keys for the *same* page. Stripping them collapses thousands of campaign variants into one cached object → far higher cache hit ratio and less origin load.
-- **Cleaner analytics & logs.** Tracking params stop polluting your server logs and origin-side analytics.
-- **Zero origin code.** No plugin, no `.htaccess`, no application change. It runs in Cloudflare's network.
-- **Privacy hygiene.** Click identifiers like `fbclid`/`gclid` never reach your backend.
+## How it behaves
 
-**Trade-off to be aware of:** because this is a *rewrite*, server-side analytics on your origin won't see the UTM values either. If your campaign attribution depends on the origin reading UTMs, do attribution **client-side** (the params are still in the browser URL) or use a Redirect Rule and capture them before redirecting. See [Caveats](#caveats--gotchas).
+| Request | Origin receives | Response to the browser |
+|---|---|---|
+| `/?fbclid=x&a=1` | `/?a=1` | origin's response |
+| `/p/?utm_source=a&page=2&gclid=b` | `/p/?page=2` | origin's response |
+| `/p/?utm_source=a` | `/p/` | origin's response (cacheable) |
+| `/p?gclid=G` → origin 301 `/p/` | `/p` | 301 **`/p/?gclid=G`** |
+| `example.com/?gclid=G` → origin 301 `www.example.com/` | `/` | 301 **`www.example.com/?gclid=G`** |
+| `/checkout/?fbclid=F` → origin 302 `payu.com/…` | `/checkout/` | 302 `payu.com/…` (cross-site, untouched) |
+| `POST /?wc-ajax=…&utm_source=a` | unchanged | unchanged |
+| `/p/?ref=abc&q=a%20b` | unchanged (nothing to strip) | unchanged |
 
----
+- Matching is case-insensitive and works on raw `name=value` segments, so kept parameters reach
+  the origin byte-for-byte (no `%20` → `+` re-encoding).
+- If the origin already kept a parameter in `Location`, it is not duplicated.
 
-## Prerequisites
+### Parameters stripped
 
-- A domain active on Cloudflare (any plan — Transform Rules are available on Free and up).
-- Access to the Cloudflare Dashboard with permission to edit **Rules**.
+`utm_*`, `mtm_*`, `pk_*` (prefix), plus:
 
----
+| Source | Parameters |
+|---|---|
+| Google | `gclid` `gclsrc` `gbraid` `wbraid` `gad` `gad_source` `gad_campaignid` `srsltid` `_ga` `_gl` `dclid` `campaignid` `adgroupid` `adid` `s_kwcid` `ef_id` `mkwid` `pcrid` |
+| Meta | `fbclid` `fb_action_ids` `fb_action_types` `fb_source` |
+| Microsoft, TikTok, Pinterest, LinkedIn, X | `msclkid` `ttclid` `epik` `pp` `li_fat_id` `twclid` |
+| Mailing / affiliate | `mc_cid` `mc_eid` `_ke` `_kx` `trk_contact` `trk_msg` `trk_module` `trk_sid` `_bta_tid` `_bta_c` `gdfms` `gdftrk` `gdffi` `sscid` `dm_i` `ssp_iabi` `ssp_iaba` `vgo_ee` |
 
-## Step-by-step setup (Cloudflare Dashboard)
+Deliberately **not** stripped (they were in v0.1.0 but change page behaviour): `ref` (affiliate
+plugins), `ao_noptimize` (Autoptimize debug switch), `cn-reloaded` (Cookie Notice), `usqp`,
+`age-verified`, `redirect_*mongo_id`, `sb_referer_host`.
 
-1. **Log in** to the [Cloudflare Dashboard](https://dash.cloudflare.com) and select your domain (zone).
+Edit `TRACKING_PARAMS` / `TRACKING_PREFIXES` in [`worker/src/index.js`](worker/src/index.js) to change the list.
 
-2. In the left sidebar go to **Rules → Overview** (on some accounts: **Rules → Transform Rules**).
+## Setup
 
-3. Click **Create rule**, then choose **Rewrite URL**.
-   *(Menu wording varies slightly by account — you want the rule type that lets you rewrite the **Path** and **Query**, not the Redirect type.)*
+Requires the [`cf` CLI](https://developers.cloudflare.com/) logged in to your account, Node 22+.
 
-4. **Name your rule**, e.g. `Strip tracking parameters`.
-
-5. Under **If… / When incoming requests match…**, select **Custom filter expression**.
-
-   > *"Only apply the rule to requests matching the custom filter expression."*
-
-6. Click **Edit expression** (the `</>` toggle) to switch to the raw expression editor and paste the contents of **[`filter-expression.txt`](filter-expression.txt)** (also shown [below](#1-filter-expression-the-if)).
-
-7. Scroll to the **Then… / Set Rewrite parameters** section.
-
-   - **Path** → leave on **Preserve** (we are not touching the path).
-   - **Query** → select **Rewrite to…**
-   - In the dropdown next to the Query field, choose **Dynamic** (not *Static*). Dynamic lets you use an expression/function as the value.
-   - Paste the contents of **[`rewrite-expression.txt`](rewrite-expression.txt)** (also shown [below](#2-rewrite-expression-the-then)) into the value field.
-
-8. Click **Deploy** (or **Save**).
-
-That's it. Hit a URL with a `?utm_source=...` and watch it get cleaned.
-
----
-
-## The two expressions
-
-### 1. Filter expression (the *If*)
-
-This decides **whether** the rule runs. It checks if the query string contains any of the tracked parameter names.
-
-```
-(http.request.uri.query contains "utm_source") or (http.request.uri.query contains "utm_medium") or (http.request.uri.query contains "utm_campaign") or (http.request.uri.query contains "utm_expid") or (http.request.uri.query contains "utm_term") or (http.request.uri.query contains "utm_content") or (http.request.uri.query contains "utm_id") or (http.request.uri.query contains "utm_source_platform") or (http.request.uri.query contains "utm_creative_format") or (http.request.uri.query contains "utm_marketing_tactic") or (http.request.uri.query contains "mtm_source") or (http.request.uri.query contains "mtm_medium") or (http.request.uri.query contains "mtm_campaign") or (http.request.uri.query contains "mtm_keyword") or (http.request.uri.query contains "mtm_cid") or (http.request.uri.query contains "mtm_content") or (http.request.uri.query contains "pk_source") or (http.request.uri.query contains "pk_medium") or (http.request.uri.query contains "pk_campaign") or (http.request.uri.query contains "pk_keyword") or (http.request.uri.query contains "pk_cid") or (http.request.uri.query contains "pk_content") or (http.request.uri.query contains "fb_action_ids") or (http.request.uri.query contains "fb_action_types") or (http.request.uri.query contains "fb_source") or (http.request.uri.query contains "fbclid") or (http.request.uri.query contains "campaignid") or (http.request.uri.query contains "adgroupid") or (http.request.uri.query contains "adid") or (http.request.uri.query contains "gclid") or (http.request.uri.query contains "age-verified") or (http.request.uri.query contains "ao_noptimize") or (http.request.uri.query contains "usqp") or (http.request.uri.query contains "cn-reloaded") or (http.request.uri.query contains "_ga") or (http.request.uri.query contains "sscid") or (http.request.uri.query contains "gclsrc") or (http.request.uri.query contains "_gl") or (http.request.uri.query contains "mc_cid") or (http.request.uri.query contains "mc_eid") or (http.request.uri.query contains "_bta_tid") or (http.request.uri.query contains "_bta_c") or (http.request.uri.query contains "trk_contact") or (http.request.uri.query contains "trk_msg") or (http.request.uri.query contains "trk_module") or (http.request.uri.query contains "trk_sid") or (http.request.uri.query contains "gdfms") or (http.request.uri.query contains "gdftrk") or (http.request.uri.query contains "gdffi") or (http.request.uri.query contains "_ke") or (http.request.uri.query contains "_kx") or (http.request.uri.query contains "redirect_log_mongo_id") or (http.request.uri.query contains "redirect_mongo_id") or (http.request.uri.query contains "sb_referer_host") or (http.request.uri.query contains "mkwid") or (http.request.uri.query contains "pcrid") or (http.request.uri.query contains "ef_id") or (http.request.uri.query contains "s_kwcid") or (http.request.uri.query contains "msclkid") or (http.request.uri.query contains "dm_i") or (http.request.uri.query contains "epik") or (http.request.uri.query contains "pp") or (http.request.uri.query contains "gbraid") or (http.request.uri.query contains "wbraid") or (http.request.uri.query contains "ssp_iabi") or (http.request.uri.query contains "ssp_iaba") or (http.request.uri.query contains "gad") or (http.request.uri.query contains "vgo_ee") or (http.request.uri.query contains "gad_source") or (http.request.uri.query contains "ref") or (http.request.uri.query contains "ttclid")
+```bash
+cd worker
+npm install
+npm test                                  # stub origin, see "Testing"
+cp hosts.example.json hosts.json          # gitignored — your zones stay out of the repo
 ```
 
-### 2. Rewrite expression (the *Then*)
+`hosts.json` lists the hosts the Worker is routed on. Include every host that can **issue** a
+redirect, e.g. both apex and `www` when one redirects to the other:
 
-This is the **Query → Rewrite to → Dynamic** value. It rebuilds the query string without the tracking parameters.
-
-```
-regex_replace(http.request.uri.query, "(?:(?:^|&)(?:utm_source|utm_medium|utm_campaign|utm_expid|utm_term|utm_content|utm_id|utm_source_platform|utm_creative_format|utm_marketing_tactic|mtm_source|mtm_medium|mtm_campaign|mtm_keyword|mtm_cid|mtm_content|pk_source|pk_medium|pk_campaign|pk_keyword|pk_cid|pk_content|fb_action_ids|fb_action_types|fb_source|fbclid|campaignid|adgroupid|adid|gclid|age-verified|ao_noptimize|usqp|cn-reloaded|_ga|sscid|gclsrc|_gl|mc_cid|mc_eid|_bta_tid|_bta_c|trk_contact|trk_msg|trk_module|trk_sid|gdfms|gdftrk|gdffi|_ke|_kx|redirect_log_mongo_id|redirect_mongo_id|sb_referer_host|mkwid|pcrid|ef_id|s_kwcid|msclkid|dm_i|epik|pp|gbraid|wbraid|ssp_iabi|ssp_iaba|gad|vgo_ee|gad_source|ref|ttclid)=[^&]*)+", "")
-```
-
----
-
-## Understanding the regex
-
-If you've never read a regex like this, here's the intuition. We're operating on the **query string only** — the part after the `?`, e.g. `id=42&utm_source=news&fbclid=abc`.
-
-```
-(?:(?:^|&)(?:utm_source|utm_medium|...|ttclid)=[^&]*)+
+```json
+[
+	{ "zone": "example.com", "hosts": ["example.com", "www.example.com"] }
+]
 ```
 
-Breaking it down piece by piece:
+Create an API token (**My Profile → API Tokens → Custom token**) with **Zone → Zone → Read** and
+**Zone → Workers Routes → Edit** for the zones in `hosts.json`, then:
 
-- `(?: ... )` — a **non-capturing group**. It groups things together without saving a numbered backreference (slightly faster, cleaner).
-- `(?:^|&)` — match either the **start of the string** (`^`) or a **`&`** separator. This is what anchors us to the *beginning of a parameter*, so we don't accidentally match `utm_source` if it appeared inside some value.
-- `(?:utm_source|utm_medium|...|ttclid)` — the **alternation list**: match any one of these parameter names. The `|` means "or".
-- `=[^&]*` — match the `=` and then the value: `[^&]*` means "any number of characters that are **not** an `&`", i.e. everything up to the next parameter.
-- The trailing `+` — match **one or more** consecutive tracking params in a row. This is the clever part: if you have `&utm_source=a&utm_medium=b&fbclid=c` all in a row, they get consumed in a single match (including their leading `&`s), so you don't end up with leftover `&&` gaps.
+```bash
+export CLOUDFLARE_API_TOKEN=…
+npm run deploy        # cf deploy, then scripts/ensure-routes.mjs
+npm run routes:check  # read-only: exit 1 if any route is wrong
+```
 
-Replacing all matches with `""` (empty string) deletes them.
+`npm run deploy` runs `cf deploy` (uploads the Worker, creates `<host>/*` routes) and then
+[`scripts/ensure-routes.mjs`](worker/scripts/ensure-routes.mjs), which makes the zone match
+`hosts.json`:
 
-### Why `contains` in the filter but a strict regex in the rewrite?
+1. **Fail open on every Worker route.** The default — and the state **`cf deploy` resets every
+   route to on each deploy** — is *fail closed*: over the Free plan limit, the whole site returns
+   error 1027. With fail open, traffic goes straight to the origin with the full URL: correct, just
+   no cache gain. (The API field is `request_limit_fail_open`; it is returned by
+   `GET /zones/:id/workers/routes` but missing from the public API reference.)
+2. **Exclusion routes** with no Worker for `<host>/wp-content/*`, `/wp-includes/*`, `/wp-admin/*`,
+   `/wp-json/*`. The more specific route wins, so assets never invoke the Worker and don't count
+   toward limits.
 
-- The **filter** uses cheap `contains` checks just to decide *should we even run this rule?* It's intentionally loose and fast — false positives are harmless because the rewrite does the real work.
-- The **rewrite regex** is strict (`=` and `&` boundaries) so it only removes genuine `key=value` parameters and never mangles a path or a legitimate value that merely happens to contain a tracking word.
+It never overwrites a route owned by another Worker — that is reported and exits 1. Without a
+token, do both steps by hand in **zone → Workers Routes** (Edit → *Request limit failure mode*).
 
-> **Compared to other approaches:** doing this in Nginx (`map`/`rewrite`), Apache (`mod_rewrite`), or app middleware all work too — but they run *on your origin*, after the request has already crossed the network and possibly missed cache. Cloudflare does it one hop earlier, at the edge, with no deploy.
+> [!WARNING]
+> If you deploy with plain `cf deploy` (not `npm run deploy`), run `npm run routes` afterwards —
+> otherwise the routes stay *fail closed*.
 
----
+Finally, disable any Transform Rule that strips the same parameters — Transform Rules run
+**before** Workers, so parameters removed there can't be restored.
 
 ## Testing
 
-After deploying, test with `curl` (look at the final resolved URL / response) or just your browser's network tab.
+```bash
+npm test
+```
 
-Cloudflare also provides an **Expression Preview / Trace** tool under **Rules → Trace** where you can feed in a sample URL and confirm which rules fire.
+18 Worker cases with `fetch` replaced by a stub origin: parameter position, non-adjacent parameters,
+redirect restoration (relative `Location`, apex ↔ `www`, cross-site), duplicates, `POST`,
+byte-for-byte forwarding, encoded/upper-case names (`%67clid`, `GCLID`), malformed
+percent-encoding — plus 5 cases for `ensure-routes.mjs` against a stub API. It proves the logic, not the Cloudflare
+runtime — after deploying, check a real redirect:
 
-Sample URLs to try:
+```bash
+curl -sI "https://example.com/some-page?gclid=T&a=1"
+# if the origin redirects, `location:` must still contain gclid=T
+```
 
-| Input | Expected output query |
-|-------|----------------------|
-| `?utm_source=x` | *(empty)* |
-| `?id=42&utm_source=x&utm_medium=y` | `id=42` |
-| `?gclid=abc&page=2` | `page=2` |
-| `?fbclid=a&utm_campaign=b&ref=c` | *(empty)* |
-| `?q=hello` | `q=hello` *(rule doesn't fire — nothing to strip)* |
+On a WordPress site, a URL without the trailing slash is the easiest way to get an origin redirect.
 
----
+## Cost and limits
 
-## Customizing the parameter list
+Worker routes cannot match on the query string, so the Worker runs on **every** request of its
+routes — hence the exclusions above. Security rules (WAF, rate limiting, Bot Fight Mode) run
+before Workers; blocked requests don't count.
 
-The list is deliberately broad but you may want to **add** or **remove** entries:
+| Runtime | Runs on | Price | Limit |
+|---|---|---|---|
+| Workers Free | every routed request | $0 | 100,000 requests/day per **account** |
+| Workers Paid | every routed request | $5/month per account | 10M requests/month, then $0.30/M |
+| Snippets | only requests matching a rule expression | included in Pro+ | none per request |
 
-- **To add a parameter:** add it to *both* expressions — a new `or (http.request.uri.query contains "yourparam")` in the filter, and a new `|yourparam` inside the alternation in the rewrite regex.
-- **To remove one:** delete it from both places.
+[`worker/src/index.js`](worker/src/index.js) is plain JavaScript and works as a
+[Snippet](https://developers.cloudflare.com/rules/snippets/) unchanged — with a rule such as
+`http.request.uri.query contains "gclid" or …` it only runs for tracking URLs. Snippets need the
+Pro plan per zone.
 
-### ⚠️ Watch out for `ref` and `pp`
+For reference: one mid-size WooCommerce store used ~2.8k Worker requests overnight with the
+exclusions in place.
 
-This list includes a couple of **short, generic** names that are common tracking params but can collide with legitimate ones:
+## Why not a Transform Rule?
 
-- **`ref`** — widely used as a tracking/referrer param, but some apps use `ref` for real functionality (e.g. referral codes, git refs in API calls). If your site uses `ref` meaningfully, **remove it** from both expressions.
-- **`pp`** — even more generic. Remove it if you use it for anything real.
+Short version (details in [POSTMORTEM.md](POSTMORTEM.md#root-cause)):
 
-Always review the list against your own application's known query parameters before deploying.
+- one `regex_replace()` per expression, first match only, RE2 without lookarounds — removing an
+  arbitrary set of non-adjacent parameters cleanly is not expressible;
+- even a perfect regex cannot fix redirects: the origin builds `Location` from the URL it was given.
 
----
+If Cloudflare caches your HTML, a **Cache Rule** with *Cache key → Query string → Exclude* is the
+other correct option: the cache ignores the parameters, the origin still receives them.
 
-## Caveats & gotchas
+## Files
 
-- **Rewrite ≠ redirect (address bar stays dirty).** This Transform Rule cleans the URL that Cloudflare/origin/cache see, but the visitor's browser still shows the original link. To clean the **address bar**, create a **Redirect Rule** that 301s to the stripped URL instead. Downside of redirecting: an extra round-trip for every campaign click.
-- **Origin-side attribution.** Since UTMs are stripped before reaching origin, any server-side analytics relying on them won't see them. Move attribution client-side or use a redirect approach that logs first.
-- **One leading `?` edge case.** Cloudflare handles the `?` for you (the expression operates on `http.request.uri.query`, which excludes the `?`). You don't need to account for it.
-- **Order of rules matters.** If you have other Transform/Redirect rules touching the query, check their execution order under **Rules → Overview**.
-- **Expression size limits.** Very large parameter lists can hit the dashboard's expression character limit (the editor shows a counter, e.g. `3434 / 4096`). If you exceed it, split into multiple rules or trim the list.
-
----
-
-## Files in this repo
-
-| File | Purpose |
-|------|---------|
-| [`README.md`](README.md) | This guide. |
-| [`filter-expression.txt`](filter-expression.txt) | The *If* — paste into the custom filter expression editor. |
-| [`rewrite-expression.txt`](rewrite-expression.txt) | The *Then* — paste into Query → Rewrite to → Dynamic. |
-
----
+| Path | Purpose |
+|---|---|
+| [`worker/`](worker/) | The Worker (`src/index.js`), route setup (`scripts/ensure-routes.mjs`), tests, `cloudflare.config.ts`, `hosts.example.json`. |
+| [`POSTMORTEM.md`](POSTMORTEM.md) | What went wrong with v0.1.0 and how it was found and fixed. |
+| [`CHANGELOG.md`](CHANGELOG.md) | Release notes. |
+| [`legacy/`](legacy/) | ⛔ The withdrawn v0.1.0 Transform Rule expressions, kept for reference only. |
 
 ## License
 
